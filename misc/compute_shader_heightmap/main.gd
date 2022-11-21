@@ -1,11 +1,4 @@
-extends Control
-
-@export_file("*.glsl") var shader_file
-@export_range(128, 4096, 1, "exp") var dimension: int = 512
-
-@onready var seed_input: TextEdit = $CenterContainer/VBoxContainer/PanelContainer/VBoxContainer/GridContainer/SeedInput
-@onready var heightmap_rect: TextureRect = $CenterContainer/VBoxContainer/PanelContainer2/VBoxContainer/HBoxContainer/RawHeightmap
-@onready var island_rect: TextureRect = $CenterContainer/VBoxContainer/PanelContainer2/VBoxContainer/HBoxContainer/ComputedHeightmap
+extends Node
 
 var noise: FastNoiseLite
 var gradient: Gradient
@@ -33,43 +26,35 @@ func _init() -> void:
 	gradient_tex.gradient = gradient
 
 
-func _ready() -> void:
-	randomize_seed()
-	# Round dimension to nearest power of 2
-	print(dimension)
+func _ready():
+	await run_both()
+	get_tree().quit()
+
+
+func prepare_image(seed: int, dimension: int = 512) -> Image:
 	po2_dimensions = nearest_po2(dimension)
 
 	noise.frequency = 0.003 / (float(po2_dimensions) / float(512))
 
-
-# Generate a random integer, convert it to a string and set it as text for the TextEdit field
-func randomize_seed() -> void:
-	seed_input.text = str(randi())
-
-
-func prepare_image() -> Image:
 	# Store starting time
 	start_time = Time.get_ticks_usec()
 	# Use the to_int() method on the String to convert to a valid seed
-	noise.seed = seed_input.text.to_int()
+	noise.seed = seed
 	# Create image from noise
 	var heightmap := noise.get_image(po2_dimensions, po2_dimensions, false, false)
-
-	# Create ImageTexture to display original on screen
-	var clone = Image.new()
-	clone.copy_from(heightmap)
-	clone.resize(512, 512, Image.INTERPOLATE_NEAREST)
-	var clone_tex := ImageTexture.create_from_image(clone)
-	heightmap_rect.texture = clone_tex
 
 	return heightmap
 
 
-func compute_island_gpu(heightmap: Image) -> void:
+func compute_island_gpu(heightmap: Image) -> Image:
 	# Create rendering device
 	var rd := RenderingServer.create_local_rendering_device()
+	if rd == null:
+		print("Render driver does not support RenderingDevice")
+		return null
+
 	# Prepare the shader
-	var shader_rid := load_shader(rd, shader_file)
+	var shader_rid := load_shader(rd, "res://compute_shader.glsl")
 
 	# Create format for heightmap
 	var heightmap_format := RDTextureFormat.new()
@@ -102,7 +87,7 @@ func compute_island_gpu(heightmap: Image) -> void:
 	# but for illustrative purposes we use four channels (RGBA)
 	gradient_format.format = RenderingDevice.DATA_FORMAT_R8G8B8A8_UNORM
 	gradient_format.width = gradient_tex.width # default: 256
-	# GradientTexture1D always has a height of 1
+	# GradientTexture1D always has a height of 1p
 	gradient_format.height = 1
 	gradient_format.usage_bits = \
 		RenderingDevice.TEXTURE_USAGE_STORAGE_BIT + \
@@ -135,22 +120,30 @@ func compute_island_gpu(heightmap: Image) -> void:
 
 	# Retrieve processed data
 	var output_bytes := rd.texture_get_data(heightmap_rid, 0)
-	var island_img := Image.new()
+
+	rd.free_rid(pipeline)
+	rd.free_rid(uniform_set)
+	rd.free_rid(gradient_rid)
+	rd.free_rid(heightmap_rid)
+	rd.free_rid(shader_rid)
+
 	# Even though the GPU was working on the image as if each byte represented the red channel, we
 	# will interpret the data as if it was the luminance channel.
-	island_img.create_from_data(po2_dimensions, po2_dimensions, false, Image.FORMAT_L8, output_bytes)
+	var island_img := Image.create_from_data(po2_dimensions, po2_dimensions, false, Image.FORMAT_L8, output_bytes)
 
-	display_island(island_img)
+	rd.free()
+
+	return island_img
 
 
 # Import, compile and load shader, return reference
 func load_shader(rd: RenderingDevice, path: String) -> RID:
-	var shader_file_data := load(path)
+	var shader_file_data: RDShaderFile = load(path)
 	var shader_spirv: RDShaderSPIRV = shader_file_data.get_spirv()
 	return rd.shader_create_from_spirv(shader_spirv)
 
 
-func compute_island_cpu(heightmap: Image) -> void:
+func compute_island_cpu(heightmap: Image) -> Image:
 	var center := Vector2i(po2_dimensions, po2_dimensions) / 2
 	# Loop over all pixel coords in the image
 	for y in range(0, po2_dimensions):
@@ -168,33 +161,28 @@ func compute_island_cpu(heightmap: Image) -> void:
 			if pixel.v < 0.2:
 				pixel.v = 0.0
 			heightmap.set_pixelv(coord, pixel)
-	display_island(heightmap)
+	return heightmap
 
+func run_both() -> void:
+	var seed = randi()
+	await run(false, seed)
+	await run(true, seed)
+	await run(true, seed)
 
-func display_island(island: Image) -> void:
-	island.resize(512, 512, Image.INTERPOLATE_NEAREST)
-	# Create ImageTexture to display original on screen
-	var island_tex := ImageTexture.create_from_image(island)
-	island_rect.texture = island_tex
+func run(gpu: bool, seed: int) -> void:
+	print("start %s" % ("gpu" if gpu else "cpu"))
+	var heightmap = prepare_image(seed)
+	await get_tree().process_frame
+	var img: Image
+	if gpu:
+		img = compute_island_gpu(heightmap)
+	else:
+		img = compute_island_cpu(heightmap)
 
-	# Calculate and display elapsed time
-	var stop_time := Time.get_ticks_usec()
-	var elapsed := stop_time - start_time
-	$CenterContainer/VBoxContainer/PanelContainer2/VBoxContainer/HBoxContainer2/Label2.text = str(elapsed) + " μs"
-
-
-# Called when RandomButton is pressed
-func _on_random_button_pressed() -> void:
-	randomize_seed()
-
-
-# Called when CreateButton is pressed
-func _on_create_button_pressed() -> void:
-	var heightmap = prepare_image()
-	call_deferred("compute_island_gpu", heightmap)
-
-
-# Called when CreateButtonCPU is pressed
-func _on_create_button_cpu_pressed():
-	var heightmap = prepare_image()
-	call_deferred("compute_island_cpu", heightmap)
+	DirAccess.open("res://").make_dir("out")
+	var path = "res://out/out_%s_%s.png" % [seed, "gpu" if gpu else "cpu"]
+	if img:
+		print(path)
+		img.save_png(path)
+	else:
+		print("img is null")
